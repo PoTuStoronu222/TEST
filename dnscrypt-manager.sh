@@ -2,7 +2,7 @@
 # DNSCrypt Manager
 # Primary DNS manager based on dnscrypt-proxy2.
 # Canonical filename: dnscrypt-manager.sh
-VERSION="2.0"
+VERSION="2.2"
 
 BASE_DIR="/etc/dnscrypt-manager"
 STATE_DIR="$BASE_DIR/state"
@@ -21,10 +21,10 @@ MANAGER_INIT="/etc/init.d/dnscrypt-manager"
 MAIN_PORT=5053
 RU_PORT=5054
 TEST_PORT_FIRST=5400
-TEST_PORT_LAST=5499
-TEST_CONCURRENCY=10
-TEST_TIMEOUT=8
-CATALOG_SCAN_WAIT=8
+TEST_PORT_LAST=5599
+TEST_CONCURRENCY=12
+TEST_TIMEOUT=4
+CATALOG_SCAN_WAIT=4
 
 C_GREEN='\033[1;32m'; C_RED='\033[1;31m'; C_CYAN='\033[1;36m'; C_YELLOW='\033[1;33m'; C_MAGENTA='\033[1;35m'; C_NC='\033[0m'; C_BOLD='\033[1m'; C_WHITE='\033[1;37m'
 
@@ -220,7 +220,7 @@ doh_servers = true
 odoh_servers = false
 ignore_system_dns = true
 bootstrap_resolvers = ['9.9.9.11:53', '8.8.8.8:53']
-netprobe_timeout = 10
+netprobe_timeout = 3
 netprobe_address = '9.9.9.9:53'
 lb_strategy = 'wp2'
 lb_estimator = true
@@ -530,29 +530,45 @@ show_status(){ clear 2>/dev/null || true; printf '\n%b\n\n' "${C_BOLD}${C_YELLOW
 select_slot(){ slot="$1"; clear 2>/dev/null || true; printf "\n${C_BOLD}Слот %s — выберите DNS${C_NC}\n\n" "$slot"; n=1; while IFS='|' read -r id cat name url region stamp; do [ -n "$id" ] || continue; if [ "$slot" = RU ] && [ "$cat" != regional ]; then continue; fi; printf "[%3s] %-32s [%s/%s]\n" "$n" "$name" "$cat" "$region"; eval "SEL_$n=\"$id\""; n=$((n+1)); done < "$CATALOG"; printf "\n[99] Очистить  [Enter] Назад\n"; printf 'Выбор: '; read -r c; [ -n "$c" ] || return; if [ "$c" = 99 ]; then eval "SLOT_$slot=\"\""; save_state; return; fi; eval "id=\${SEL_$c:-}" 2>/dev/null; [ -n "$id" ] || { warn "Неверный выбор."; pause; return; }; [ "$slot" != RU ] || [ "$(cat_of "$id")" = regional ] || { err "В RU-слот разрешены только региональные DNS."; pause; return; }; eval "SLOT_$slot=\"$id\""; save_state; }
 select_from_scan(){
     f="$STATE_DIR/catalog-test-results"
-    [ -s "$f" ] || { warn "Сначала выполните проверку каталога [C]."; pause; return 1; }
+    [ -s "$f" ] || { warn "Сначала запусти скан каталога."; pause; return 1; }
     clear 2>/dev/null || true
-    printf '\n${C_BOLD}РАБОЧИЕ DNS ИЗ ПОСЛЕДНЕГО СКАНА${C_NC}\n\n'
-    n=1
-    : > "$TMP/working-map"
-    while IFS='|' read -r st id name region cat extra; do
-        [ "$st" = OK ] || continue
-        printf '[%3s] %-34s [%s/%s]\n' "$n" "$name" "$cat" "$region"
-        printf '%s|%s\n' "$n" "$id" >> "$TMP/working-map"
-        n=$((n+1))
-    done < "$f"
-    [ "$n" -gt 1 ] || { warn "Рабочих DNS нет."; pause; return 1; }
-    printf '\nВыберите до 12 номеров через пробел, например: 1 4 7 9\n'
-    printf 'Выбор: '; read -r picks
-    [ -n "$picks" ] || return 0
-    for s in 1 2 3 4 5 6 7 8 9 10 11 12; do eval "SLOT_$s=\"\""; done
+    printf '\n%b\n\n' "${C_BOLD}ВЫБОР ИЗ РАБОЧИХ DNS${C_NC}"
+    n="$(awk -F'|' '$1=="OK"{n++}END{print n+0}' "$f")"
+    [ "$n" -gt 0 ] || { warn "Рабочих DNS нет."; pause; return 1; }
+    printf 'Найдено рабочих: %s\n\n' "$n"
+    printf 'Сколько DNS поставить в основной пул? [6]: '; read -r cnt; [ -n "$cnt" ] || cnt=6
+    case "$cnt" in *[!0-9]*|'') cnt=6;; esac
+    [ "$cnt" -gt 12 ] && cnt=12; [ "$cnt" -lt 1 ] && cnt=1
+    for ss in 1 2 3 4 5 6 7 8 9 10 11 12; do eval "SLOT_$ss="""; done
     sn=1
-    for x in $picks; do [ "$sn" -le 12 ] || break; id="$(awk -F'|' -v n="$x" '$1==n{print $2;exit}' "$TMP/working-map")"; [ -n "$id" ] || continue; eval "SLOT_$sn=\"$id\""; sn=$((sn+1)); done
-    save_state
-    ok "Выбран рабочий набор: $((sn-1)) DNS."
+    while IFS='|' read -r st id name region cat extra; do
+        [ "$st" = OK ] || continue; [ "$sn" -le "$cnt" ] || break
+        eval "SLOT_$sn="$id""; sn=$((sn+1))
+    done < "$f"
+    save_state; ok "В основной пул добавлено $((sn-1)) проверенных DNS."
 }
 
-menu_dns(){ while :; do clear 2>/dev/null || true; printf "\\n${C_BOLD}DNS / HYBRID${C_NC}\\n\\n"; for s in 1 2 3 4 5 6 7 8 9 10 11 12 RU; do eval "v=\$SLOT_$s"; [ -n "$v" ] && printf "  %-3s %-32s %s\\n" "$s" "$(name_of "$v")" "$(region_of "$v")" || printf "  %-3s —\\n" "$s"; done; printf "\\n[1-12] Изменить основной DNS\\n[r]  Изменить RU DNS\\n[a]  Сбросить Hybrid по умолчанию\\n[t]  Проверить выбранный набор\\n[c]  Проверить весь каталог (%s)\\n[s]  Выбрать рабочие DNS из скана\\n[x]  Применить DNSCrypt\\n[b]  Назад\\n" "$(grep -c '^[^#[:space:]]*|' '$CATALOG' 2>/dev/null || printf 0)"; menu_prompt; read -r c; case "$c" in 1|2|3|4|5|6|7|8|9|10|11|12) select_slot "$c";; r|R) select_slot RU;; a|A) set_defaults; save_state; ok "Hybrid-набор восстановлен."; pause;; t) test_selected; pause;; c|C) test_catalog_all; pause;; s|S) select_from_scan;; x|X) printf 'Применить DNSCrypt как основной DNS? [Y/n]: '; read -r a; case "$a" in n|N|нет|Нет) ;; *) apply_dns && ok "Основной DNSCrypt и RU routing применены." || err "Применение DNS не завершено.";; esac; pause;; b|B|"") return;; esac; done; }
+menu_dns(){
+    while :; do
+        clear 2>/dev/null || true
+        printf '\n%b\n\n' "${C_BOLD}DNS / HYBRID${C_NC}"
+        for ss in 1 2 3 4 5 6 7 8 9 10 11 12; do eval "v=\$SLOT_$ss"; [ -n "$v" ] && printf '  %2s. %-32s %s\n' "$ss" "$(name_of "$v")" "$(region_of "$v")" || printf '  %2s. —\n' "$ss"; done
+        printf '  RU. %-32s %s\n' "$( [ -n "$SLOT_RU" ] && name_of "$SLOT_RU" || printf '—' )" "$( [ -n "$SLOT_RU" ] && region_of "$SLOT_RU" || printf '' )"
+        printf '\n  [1] Выбрать рабочие DNS из последнего скана\n  [2] Настроить RU DNS\n  [3] Проверить текущий пул\n  [4] Проверить весь каталог (%s)\n  [5] Применить DNSCrypt\n  [6] Сбросить Hybrid по умолчанию\n  [b] Назад\n\n' "$(awk -F'|' 'NF>=6&&$1!=""{n++}END{print n+0}' "$CATALOG")"
+        menu_prompt; read -r c
+        case "$c" in
+            1) select_from_scan; pause;;
+            2) select_slot RU;;
+            3) test_selected; pause;;
+            4) test_catalog_all; pause;;
+            5) apply_dns && ok "DNSCrypt применён." || err "DNS не применён."; pause;;
+            6) set_defaults; save_state; ok "Hybrid-набор восстановлен."; pause;;
+            b|B|"") return;;
+            7|8|9|10|11|12) select_slot "$c";;
+        esac
+    done
+}
+
 # ----- resolver tests -----
 test_one(){
     id="$1"; port="$2"; domain="${3:-example.com}"
@@ -583,51 +599,49 @@ scan_ids_file(){
 scan_catalog_fast(){
     list="$1"; label="${2:-Каталог}"
     [ -s "$list" ] || return 1
-    ids="$(awk -F'|' 'NF>=6 && $1!="" {printf "%s%s", sep,$1; sep=" "}' "$list")"
-    [ -n "$ids" ] || return 1
-    count="$(printf '%s\n' "$ids" | awk '{print NF}')"
-    port="$(next_free_port "$TEST_PORT_FIRST" "$TEST_PORT_LAST")" || { err "Не найден свободный тестовый порт."; return 1; }
-    cfg="$TMP/scan-$port.toml"; logf="$TMP/scan-$port.log"
-    build_proxy_config "$cfg" "$port" "$ids" 0 || return 1
-    # Full scan prioritizes speed: short per-resolver network probe timeout.
-    sed -i "s/^netprobe_timeout = .*/netprobe_timeout = 3/" "$cfg" 2>/dev/null || true
-    printf '\n  Быстрая проверка %s: %s DNS одним процессом\n' "$label" "$count"
-    printf '  Listener: 127.0.0.1:%s | ожидание результатов: %ss\n' "$port" "$CATALOG_SCAN_WAIT"
-    "$BIN" -config "$cfg" >"$logf" 2>&1 & p=$!
-    ready=0; i=0
-    while [ "$i" -lt 4 ]; do
-        port_in_use "$port" && { ready=1; break; }
-        kill -0 "$p" 2>/dev/null || break
-        sleep 1; i=$((i+1))
-    done
-    if [ "$ready" != 1 ]; then
-        err "Тестовый dnscrypt-proxy не открыл listener."
-        tail -40 "$logf"; kill "$p" 2>/dev/null || true; kill -9 "$p" 2>/dev/null || true
-        return 1
-    fi
-    # Give dnscrypt-proxy time to resolve/probe all server hosts in parallel.
-    sleep "$CATALOG_SCAN_WAIT"
-    passed=0; tested=0
+    count="$(awk -F'|' 'NF>=6 && $1!="" {n++} END{print n+0}' "$list")"
+    [ "$count" -gt 0 ] || return 1
+    printf '\n  Быстрый скан %s: %s DNS, параллельно до %s\n' "$label" "$count" "$TEST_CONCURRENCY"
+    printf '  Проверяем реальный DoH/DNSCrypt + DNS-запрос. Таймаут %ss на DNS.\n\n' "$TEST_TIMEOUT"
+    rm -f "$TMP"/job-* "$TMP"/result-* 2>/dev/null || true
+    n=0; active=0; done_n=0; passed=0
+    finish_jobs(){
+        for jf in "$TMP"/job-*; do
+            [ -f "$jf" ] || continue
+            id="$(sed -n '1p' "$jf")"; name="$(sed -n '2p' "$jf")"; region="$(sed -n '3p' "$jf")"; cat="$(sed -n '4p' "$jf")"
+            [ -f "$TMP/result-$id" ] || continue
+            result="$(cat "$TMP/result-$id" 2>/dev/null || printf FAIL)"
+            if [ "$result" = OK ]; then
+                passed=$((passed+1)); printf 'OK|%s|%s|%s|%s\n' "$id" "$name" "$region" "$cat" >> "$TMP/scan-results"
+            else
+                printf 'FAIL|%s|%s|%s|%s\n' "$id" "$name" "$region" "$cat" >> "$TMP/scan-results"
+            fi
+            rm -f "$jf" "$TMP/result-$id"
+            done_n=$((done_n+1)); active=$((active-1))
+        done
+    }
     : > "$TMP/scan-results"
     while IFS='|' read -r id cat name url region stamp; do
         [ -n "$id" ] || continue
-        tested=$((tested+1))
-        if grep -Eq "\[$id\] OK \((DoH|DNSCrypt)\)" "$logf" 2>/dev/null; then
-            printf 'OK|%s|%s|%s|%s\n' "$id" "$name" "$region" "$cat" >> "$TMP/scan-results"
-            passed=$((passed+1))
-        else
-            reason="$(grep -E "\[$id\]|$name" "$logf" 2>/dev/null | tail -2 | tr '\n' ' ' | sed 's/[|]/\\//g')"
-            printf 'FAIL|%s|%s|%s|%s|%s\n' "$id" "$name" "$region" "$cat" "$reason" >> "$TMP/scan-results"
+        n=$((n+1))
+        port=$((TEST_PORT_FIRST + n - 1))
+        [ "$port" -le "$TEST_PORT_LAST" ] || { printf 'FAIL|%s|%s|%s|%s\n' "$id" "$name" "$region" "$cat" >> "$TMP/scan-results"; done_n=$((done_n+1)); continue; }
+        { printf '%s\n%s\n%s\n%s\n' "$id" "$name" "$region" "$cat"; } > "$TMP/job-$n"
+        domain="example.com"; [ "$cat" = regional ] && domain="yandex.ru"
+        ( if test_one "$id" "$port" "$domain"; then printf OK > "$TMP/result-$id"; else printf FAIL > "$TMP/result-$id"; fi ) &
+        active=$((active+1))
+        if [ "$active" -ge "$TEST_CONCURRENCY" ]; then
+            while [ "$active" -ge "$TEST_CONCURRENCY" ]; do sleep 1; finish_jobs; done
+            printf '  Проверено: %s/%s | OK: %s\r' "$done_n" "$count" "$passed"
         fi
     done < "$list"
+    while [ "$active" -gt 0 ]; do sleep 1; finish_jobs; printf '  Проверено: %s/%s | OK: %s\r' "$done_n" "$count" "$passed"; done
+    printf '\n\n'
     cp -f "$TMP/scan-results" "$STATE_DIR/catalog-test-results" 2>/dev/null || true
-    kill "$p" 2>/dev/null || true; sleep 1; kill -9 "$p" 2>/dev/null || true
-    printf '\n  Результаты: %s/%s DNS ответили\n' "$passed" "$tested"
-    printf '  Рабочие DNS сохранены: %s\n' "$STATE_DIR/catalog-test-results"
-    printf '\n  Рабочие:\n'
-    awk -F'|' '$1=="OK" {printf "  ✓ %-34s [%s/%s]\n",$2,$4,$3}' "$TMP/scan-results"
-    printf '\n  Неработающие:\n'
-    awk -F'|' '$1=="FAIL" {printf "  ✗ %-34s\n",$2}' "$TMP/scan-results"
+    printf '  РЕЗУЛЬТАТ: %s/%s DNS работают\n\n' "$passed" "$count"
+    [ "$passed" -gt 0 ] && awk -F'|' '$1=="OK" {printf "  ✓ %-34s [%s/%s]\n",$3,$5,$4}' "$TMP/scan-results"
+    printf '\n  Неработающие: %s\n' "$((count-passed))"
+    printf '  Результат сохранён. Ничего автоматически не применено.\n'
     [ "$passed" -gt 0 ]
 }
 
