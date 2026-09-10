@@ -2,7 +2,7 @@
 # DNSCrypt Manager
 # Primary DNS manager based on dnscrypt-proxy2.
 # Canonical filename: dnscrypt-manager.sh
-VERSION="1.2"
+VERSION="1.3"
 
 BASE_DIR="/etc/dnscrypt-manager"
 STATE_DIR="$BASE_DIR/state"
@@ -175,7 +175,7 @@ region_of(){ awk -F'|' -v i="$1" '$1==i{print $5;exit}' "$CATALOG"; }
 
 load_state(){
     SLOT_1=""; SLOT_2=""; SLOT_3=""; SLOT_4=""; SLOT_5=""; SLOT_6=""; SLOT_RU=""
-    BALANCE=1; CACHE=1; TLD=1; FORCE_DNS=0; QUIC=0; MSS=0; TCP=0; NTP_CLIENTS=0; WATCHDOG=1; WEB=0
+    BALANCE=1; CACHE=1; TLD=1; FORCE_DNS=0; QUIC=0; MSS=0; TCP=0; NTP_CLIENTS=0; WATCHDOG=0; WEB=0
     NTP_PRESET="cf_ip"; PROFILE="hybrid"
     [ -f "$STATE_DIR/config" ] && . "$STATE_DIR/config" 2>/dev/null || true
 }
@@ -202,26 +202,37 @@ config_delete_key(){ sed -i "/^[[:space:]]*$1[[:space:]]*=/d" "$2" 2>/dev/null |
 
 build_static(){ ids="$1"; out="$2"; : > "$out" || return 1; for id in $ids; do st="$(stamp_of "$id")"; [ -n "$st" ] || return 1; printf "[static.'%s']\nstamp = '%s'\n\n" "$id" "$st" >> "$out"; done; }
 
-build_proxy_config(){ cfg="$1" port="$2" ids="$3" is_ru="$4"; [ -f "$BASE_CFG" ] || cp -p "$MAIN_CFG" "$BASE_CFG" || return 1; cp -p "$BASE_CFG" "$cfg" || return 1
-    # Remove previously generated static sections safely by rebuilding from the clean package baseline.
-    sed -i '/^[[:space:]]*server_names[[:space:]]*=/d; /^[[:space:]]*listen_addresses[[:space:]]*=/d; /^[[:space:]]*forwarding_rules[[:space:]]*=/d' "$cfg" 2>/dev/null || true
+build_proxy_config(){ cfg="$1" port="$2" ids="$3" is_ru="$4"; [ -n "$ids" ] || return 1
+    # Do not edit the vendor example TOML in-place: it contains sample [static] data and
+    # commented keys under nested tables. Generate a minimal, deterministic config instead.
     arr=""; for id in $ids; do [ -n "$arr" ] && arr="$arr, "; arr="$arr'$id'"; done
-    config_replace_line "$cfg" listen_addresses "[\"127.0.0.1:$port\"]" || return 1
-    config_replace_line "$cfg" server_names "[$arr]" || return 1
-    config_replace_line "$cfg" ignore_system_dns true || return 1
-    config_replace_line "$cfg" ipv4_servers true || true
-    config_replace_line "$cfg" ipv6_servers false || true
-    config_replace_line "$cfg" lb_strategy "'wp2'" || return 1
-    config_replace_line "$cfg" lb_estimator true || true
+    cat > "$cfg" <<EOF_PROXY
+server_names = [$arr]
+listen_addresses = ["127.0.0.1:$port"]
+max_clients = 250
+ipv4_servers = true
+ipv6_servers = false
+dnscrypt_servers = true
+doh_servers = true
+odoh_servers = false
+ignore_system_dns = true
+bootstrap_resolvers = ['9.9.9.11:53', '8.8.8.8:53']
+netprobe_timeout = 10
+netprobe_address = '9.9.9.9:53'
+lb_strategy = 'wp2'
+lb_estimator = true
+EOF_PROXY
     if [ "$CACHE" = 1 ]; then
-        config_replace_line "$cfg" cache true || return 1
-        config_replace_line "$cfg" cache_size 4096 || true
-        config_replace_line "$cfg" cache_min_ttl 2400 || true
-        config_replace_line "$cfg" cache_max_ttl 86400 || true
-        config_replace_line "$cfg" cache_neg_min_ttl 60 || true
-        config_replace_line "$cfg" cache_neg_max_ttl 600 || true
+        cat >> "$cfg" <<EOF_PROXY
+cache = true
+cache_size = 4096
+cache_min_ttl = 2400
+cache_max_ttl = 86400
+cache_neg_min_ttl = 60
+cache_neg_max_ttl = 600
+EOF_PROXY
     else
-        config_replace_line "$cfg" cache false || return 1
+        printf '%s\n' 'cache = false' >> "$cfg"
     fi
     build_static "$ids" "$TMP/static.$$" || return 1
     cat "$TMP/static.$$" >> "$cfg" || return 1
@@ -251,7 +262,6 @@ apply_dns(){
     build_proxy_config "$TMP/main.toml" "$MAIN_PORT" "$ids" 0 || return 1
     if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then build_proxy_config "$RU_CFG" "$RU_PORT" "$SLOT_RU" 1 || return 1; else stop_ru; fi
     cp -p "$TMP/main.toml" "$MAIN_CFG" || return 1
-    "$MAIN_CFG" >/dev/null 2>&1 || true
     "$PKG_INIT" enable >/dev/null 2>&1 || true
     "$PKG_INIT" restart >/dev/null 2>&1 || return 1
     sleep 3
@@ -261,7 +271,7 @@ apply_dns(){
     verify_dns || return 1
     return 0
 }
-verify_dns(){ dns_query_local "$MAIN_PORT" example.com || return 1; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then dns_query_local "$RU_PORT" yandex.ru || return 1; fi; sec="$(get_dnsmasq_sec)"; [ "$(uci -q get dhcp.$sec.noresolv 2>/dev/null)" = 1 ] || return 1; printf '%s\n' "$(uci -q get dhcp.$sec.server 2>/dev/null)" | grep -qxF "127.0.0.1#$MAIN_PORT" || true; return 0; }
+verify_dns(){ dns_query_local "$MAIN_PORT" example.com || return 1; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then dns_query_local "$RU_PORT" yandex.ru || return 1; fi; sec="$(get_dnsmasq_sec)"; [ "$(uci -q get dhcp.$sec.noresolv 2>/dev/null)" = 1 ] || return 1; printf '%s\n' "$(uci -q get dhcp.$sec.server 2>/dev/null)" | tr ' ' '\n' | grep -qxF "127.0.0.1#$MAIN_PORT" || return 1; return 0; }
 
 # ----- extra router settings -----
 ntp_servers(){ case "$1" in cf_ip) echo '162.159.200.1 162.159.200.123';; nist_ip) echo '129.6.15.28 129.6.15.29 129.6.15.30 129.6.15.27 129.6.15.26';; google_ip) echo '216.239.35.0 216.239.35.4 216.239.35.8 216.239.35.12';; vniiftri_moscow) echo '89.109.251.21 89.109.251.22 89.109.251.23 89.109.251.24 89.109.251.25';; esac; }
@@ -303,7 +313,37 @@ EOF_SYSCTL
     return 0
 }
 apply_quic(){ if [ "$QUIC" = 1 ]; then for p in 80 443; do r="dnscrypt_manager_quic_$p"; uci -q delete "firewall.$r"; uci set "firewall.$r=rule" || return 1; uci set "firewall.$r.name=DNSCrypt Manager: UDP $p" || return 1; uci set "firewall.$r.src=lan" || return 1; uci set "firewall.$r.dest=wan" || return 1; uci set "firewall.$r.proto=udp" || return 1; uci set "firewall.$r.dest_port=$p" || return 1; uci set "firewall.$r.target=REJECT" || return 1; done; else uci -q delete firewall.dnscrypt_manager_quic_80; uci -q delete firewall.dnscrypt_manager_quic_443; fi; uci commit firewall || return 1; /etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || return 1; }
-apply_mss(){ sf="$STATE_DIR/mss-before"; if [ "$MSS" = 1 ]; then [ -f "$sf" ] || printf '%s\n' "$(uci -q get firewall.@defaults[0].mtu_fix 2>/dev/null)" > "$sf"; uci set firewall.@defaults[0].mtu_fix=1 || return 1; else if [ -f "$sf" ]; then _v="$(cat "$sf" 2>/dev/null)"; if [ -n "$_v" ]; then uci set firewall.@defaults[0].mtu_fix="$_v"; else uci -q delete firewall.@defaults[0].mtu_fix; fi; rm -f "$sf"; else uci -q delete firewall.@defaults[0].mtu_fix; fi; fi; uci commit firewall || return 1; /etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || return 1; }
+apply_mss(){
+    sf="$STATE_DIR/mss-before"
+    if [ "$MSS" = 1 ]; then
+        [ -s "$sf" ] || : > "$sf" || return 1
+        found=0
+        for z in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^=]*\)=zone$/\1/p'); do
+            zn="$(uci -q get firewall.$z.name 2>/dev/null)"
+            nets="$(uci -q get firewall.$z.network 2>/dev/null)"
+            case " $zn $nets " in
+                *' wan '*|*' wan6 '*|*' wan wan6 '*)
+                    if ! grep -q "^$z|" "$sf" 2>/dev/null; then
+                        printf '%s|%s\n' "$z" "$(uci -q get firewall.$z.mtu_fix 2>/dev/null)" >> "$sf" || return 1
+                    fi
+                    uci set firewall.$z.mtu_fix=1 || return 1
+                    found=1
+                    ;;
+            esac
+        done
+        [ "$found" = 1 ] || { err "WAN firewall zone для MSS/MTU не найден."; return 1; }
+    elif [ -s "$sf" ]; then
+        while IFS='|' read -r z v; do
+            [ -n "$z" ] || continue
+            if [ -n "$v" ]; then uci set "firewall.$z.mtu_fix=$v"; else uci -q delete "firewall.$z.mtu_fix"; fi
+        done < "$sf"
+        rm -f "$sf"
+    else
+        return 0
+    fi
+    uci commit firewall || return 1
+    /etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || return 1
+}
 apply_force(){ lan="$(uci -q get network.lan.ipaddr 2>/dev/null | cut -d/ -f1)"; if [ "$FORCE_DNS" = 1 ]; then uci -q delete firewall.dnscrypt_manager_dns_redirect; uci set firewall.dnscrypt_manager_dns_redirect=redirect || return 1; uci set firewall.dnscrypt_manager_dns_redirect.src=lan || return 1; uci set firewall.dnscrypt_manager_dns_redirect.proto='tcp udp' || return 1; uci set firewall.dnscrypt_manager_dns_redirect.src_dport=53 || return 1; uci set firewall.dnscrypt_manager_dns_redirect.dest_ip="$lan" || return 1; uci set firewall.dnscrypt_manager_dns_redirect.dest_port=53 || return 1; uci set firewall.dnscrypt_manager_dns_redirect.target=DNAT || return 1; else uci -q delete firewall.dnscrypt_manager_dns_redirect; fi; uci commit firewall || return 1; /etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || return 1; }
 apply_ntp_clients(){
     sec="$(get_dnsmasq_sec)"
@@ -404,7 +444,7 @@ EOF_CLIENT
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || return 1
 }
 remove_client_fixes(){ f="/etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf"; sf="$STATE_DIR/client-before"; if [ -s "$sf" ] && [ "$(cat "$sf" 2>/dev/null)" = ABSENT ]; then rm -f "$f"; elif [ -s "$sf" ]; then cp -p "$sf" "$f" 2>/dev/null || true; else rm -f "$f"; fi; rm -f "$sf"; /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true; }
-apply_all_extras(){ apply_tcp || return 1; apply_quic || return 1; apply_mss || return 1; apply_force || return 1; apply_ntp_clients || return 1; apply_ntp || return 1; apply_dnsmasq_perf || return 1; if [ "$WEB" = 1 ]; then apply_web || return 1; else remove_web; fi; if [ "$WATCHDOG" = 1 ]; then apply_watchdog || return 1; else remove_watchdog; fi; return 0; }
+apply_all_extras(){ apply_tcp || return 1; apply_quic || return 1; apply_mss || return 1; apply_force || return 1; apply_ntp_clients || return 1; apply_dnsmasq_perf || return 1; if [ "$WEB" = 1 ]; then apply_web || return 1; else remove_web; fi; if [ "$WATCHDOG" = 1 ]; then apply_watchdog || return 1; else remove_watchdog; fi; return 0; }
 
 # ----- watchdog + web -----
 watchdog_run(){
@@ -434,13 +474,13 @@ remove_web(){ uci -q delete ttyd.dnscrypt_manager; uci commit ttyd >/dev/null 2>
 
 # ----- status / menus -----
 state_word(){ [ "$2" = 1 ] && { [ "$1" = 1 ] && printf "${C_GREEN}✓ ВКЛ • применено${C_NC}" || printf "${C_YELLOW}⚠ ВКЛ • ожидает применения${C_NC}"; } || { [ "$1" = 1 ] && printf "${C_MAGENTA}↻ ЕСТЬ • физически включено${C_NC}" || printf "${C_RED}✗ ВЫКЛ${C_NC}"; }; }
-module_state(){ m="$1"; case "$m" in dns) [ "$(_dns_state)" = 1 ] && printf 1 || printf 0;; quic) [ "$(uci -q get firewall.dnscrypt_manager_quic_80.dest_port 2>/dev/null)" = 80 ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_443.dest_port 2>/dev/null)" = 443 ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_80.target 2>/dev/null)" = REJECT ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_443.target 2>/dev/null)" = REJECT ] && printf 1 || printf 0;; mtu) [ "$(uci -q get firewall.@defaults[0].mtu_fix 2>/dev/null)" = 1 ] && printf 1 || printf 0;; force) [ "$(uci -q get firewall.dnscrypt_manager_dns_redirect.target 2>/dev/null)" = DNAT ] && [ "$(uci -q get firewall.dnscrypt_manager_dns_redirect.src_dport 2>/dev/null)" = 53 ] && printf 1 || printf 0;; tcp) _ok=1; for kv in 'net.ipv4.tcp_fastopen=3' 'net.ipv4.tcp_fin_timeout=15' 'net.core.somaxconn=1024' 'net.netfilter.nf_conntrack_max=65536' 'net.ipv4.tcp_keepalive_time=600' 'net.ipv4.tcp_keepalive_intvl=60' 'net.ipv4.tcp_keepalive_probes=5' 'net.core.rmem_max=4194304' 'net.core.wmem_max=4194304' 'net.core.rmem_default=262144' 'net.core.wmem_default=262144'; do _k="${kv%%=*}"; _v="${kv#*=}"; [ "$(sysctl -n "$_k" 2>/dev/null)" = "$_v" ] || _ok=0; done; [ "$_ok" = 1 ] && [ -s /etc/sysctl.d/90-dnscrypt-manager.conf ] && printf 1 || printf 0;; ntp_clients) [ "$(uci -q get firewall.dnscrypt_manager_ntp.dest_port 2>/dev/null)" = 123 ] && [ "$(uci -q get firewall.dnscrypt_manager_ntp.target 2>/dev/null)" = DNAT ] && printf 1 || printf 0;; web) [ "$(uci -q get ttyd.dnscrypt_manager.enable 2>/dev/null)" = 1 ] && pgrep -f '[t]tyd.*dnscrypt-manager' >/dev/null 2>&1 && printf 1 || printf 0;; watchdog) grep -q '/usr/bin/dnscrypt-manager --watchdog' /etc/crontabs/root 2>/dev/null && printf 1 || printf 0;; client) [ -f /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf ] && grep -q '^local=/telemetry.mozilla.org/$' /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf 2>/dev/null && grep -q '^server=/clients3.google.com/77.88.8.8$' /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf 2>/dev/null && printf 1 || printf 0;; *) printf 0;; esac; }
+module_state(){ m="$1"; case "$m" in dns) [ "$(_dns_state)" = 1 ] && printf 1 || printf 0;; quic) [ "$(uci -q get firewall.dnscrypt_manager_quic_80.dest_port 2>/dev/null)" = 80 ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_443.dest_port 2>/dev/null)" = 443 ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_80.target 2>/dev/null)" = REJECT ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_443.target 2>/dev/null)" = REJECT ] && printf 1 || printf 0;; mtu) _mss_ok=0; for z in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^=]*\)=zone$/\1/p'); do zn="$(uci -q get firewall.$z.name 2>/dev/null)"; nets="$(uci -q get firewall.$z.network 2>/dev/null)"; case " $zn $nets " in *' wan '*|*' wan6 '*|*' wan wan6 '*) [ "$(uci -q get firewall.$z.mtu_fix 2>/dev/null)" = 1 ] && _mss_ok=1;; esac; done; [ "$_mss_ok" = 1 ] && printf 1 || printf 0;; force) [ "$(uci -q get firewall.dnscrypt_manager_dns_redirect.target 2>/dev/null)" = DNAT ] && [ "$(uci -q get firewall.dnscrypt_manager_dns_redirect.src_dport 2>/dev/null)" = 53 ] && printf 1 || printf 0;; tcp) _ok=1; for kv in 'net.ipv4.tcp_fastopen=3' 'net.ipv4.tcp_fin_timeout=15' 'net.core.somaxconn=1024' 'net.netfilter.nf_conntrack_max=65536' 'net.ipv4.tcp_keepalive_time=600' 'net.ipv4.tcp_keepalive_intvl=60' 'net.ipv4.tcp_keepalive_probes=5' 'net.core.rmem_max=4194304' 'net.core.wmem_max=4194304' 'net.core.rmem_default=262144' 'net.core.wmem_default=262144'; do _k="${kv%%=*}"; _v="${kv#*=}"; [ "$(sysctl -n "$_k" 2>/dev/null)" = "$_v" ] || _ok=0; done; [ "$_ok" = 1 ] && [ -s /etc/sysctl.d/90-dnscrypt-manager.conf ] && printf 1 || printf 0;; ntp_clients) [ "$(uci -q get firewall.dnscrypt_manager_ntp.dest_port 2>/dev/null)" = 123 ] && [ "$(uci -q get firewall.dnscrypt_manager_ntp.target 2>/dev/null)" = DNAT ] && printf 1 || printf 0;; web) [ "$(uci -q get ttyd.dnscrypt_manager.enable 2>/dev/null)" = 1 ] && pgrep -f '[t]tyd.*dnscrypt-manager' >/dev/null 2>&1 && printf 1 || printf 0;; watchdog) grep -q '/usr/bin/dnscrypt-manager --watchdog' /etc/crontabs/root 2>/dev/null && printf 1 || printf 0;; client) [ -f /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf ] && grep -q '^local=/telemetry.mozilla.org/$' /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf 2>/dev/null && grep -q '^server=/clients3.google.com/77.88.8.8$' /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf 2>/dev/null && printf 1 || printf 0;; *) printf 0;; esac; }
 _dns_state(){ dns_query_local "$MAIN_PORT" example.com || return 1; sec="$(get_dnsmasq_sec)"; [ "$(uci -q get dhcp.$sec.noresolv 2>/dev/null)" = 1 ] || return 1; printf '%s\n' "$(uci -q get dhcp.$sec.server 2>/dev/null)" | grep -qxF "127.0.0.1#$MAIN_PORT" || return 1; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then dns_query_local "$RU_PORT" yandex.ru || return 1; fi; return 0; }
 
 show_status(){ clear 2>/dev/null || true; printf '\n%b\n\n' "${C_BOLD}${C_YELLOW}DNSCrypt Manager $VERSION${C_NC}"; printf '  dnscrypt-proxy2:  %s\n' "$(pkg_installed && proxy_version || printf 'не установлен')"; printf '  Основной proxy:   127.0.0.1:%s  %s\n' "$MAIN_PORT" "$( [ "$(module_state dns)" = 1 ] && printf 'работает' || printf 'не активен')"; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then printf '  RU proxy:         127.0.0.1:%s  %s\n' "$RU_PORT" "$( dns_query_local "$RU_PORT" yandex.ru && printf 'работает' || printf 'не активен')"; fi; sec="$(get_dnsmasq_sec)"; printf '  dnsmasq:           %s\n' "$(/etc/init.d/dnsmasq status >/dev/null 2>&1 && printf 'работает' || printf 'не работает')"; printf '  DNS-серверов:      %s\n' "$(count_selected)"; printf '  Hybrid:            %s\n' "$PROFILE"; printf '  Балансировка:      %s\n' "$(state_word "$(grep -Eq '^[[:space:]]*lb_strategy[[:space:]]*=' "$MAIN_CFG" 2>/dev/null && printf 1 || printf 0)" "$BALANCE")"; printf '  DNS cache:         %s\n' "$(state_word "$(grep -Eq '^[[:space:]]*cache[[:space:]]*=[[:space:]]*true' "$MAIN_CFG" 2>/dev/null && printf 1 || printf 0)" "$CACHE")"; printf '  RU routing:        %s\n' "$(state_word "$( [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ] && printf 1 || printf 0)" "$TLD")"; printf '\n%b\n' "${C_YELLOW}${C_BOLD}ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ${C_NC}"; printf '  QUIC:              %s\n' "$(state_word "$(module_state quic)" "$QUIC")"; printf '  MSS/MTU:           %s\n' "$(state_word "$(module_state mtu)" "$MSS")"; printf '  Принудительный DNS:%s\n' "$(state_word "$(module_state force)" "$FORCE_DNS")"; printf '  TCP/Conntrack:     %s\n' "$(state_word "$(module_state tcp)" "$TCP")"; printf '  NTP клиентов:      %s\n' "$(state_word "$(module_state ntp_clients)" "$NTP_CLIENTS")"; printf '  Client fixes:      %s\n' "$(state_word "$(module_state client)" "$CLIENT_FIXES")"; printf '  Watchdog:          %s\n' "$(state_word "$(module_state watchdog)" "$WATCHDOG")"; printf '  Web:               %s\n' "$(state_word "$(module_state web)" "$WEB")"; }
 select_slot(){ slot="$1"; clear 2>/dev/null || true; printf "\n${C_BOLD}Слот %s — выберите DNS${C_NC}\n\n" "$slot"; n=1; while IFS='|' read -r id cat name url region stamp; do [ -n "$id" ] || continue; if [ "$slot" = RU ] && [ "$cat" != regional ]; then continue; fi; printf "[%3s] %-32s [%s/%s]\n" "$n" "$name" "$cat" "$region"; eval "SEL_$n=\"$id\""; n=$((n+1)); done < "$CATALOG"; printf "\n[99] Очистить  [Enter] Назад\n"; printf 'Выбор: '; read -r c; [ -n "$c" ] || return; if [ "$c" = 99 ]; then eval "SLOT_$slot=\"\""; save_state; return; fi; eval "id=\${SEL_$c:-}" 2>/dev/null; [ -n "$id" ] || { warn "Неверный выбор."; pause; return; }; [ "$slot" != RU ] || [ "$(cat_of "$id")" = regional ] || { err "В RU-слот разрешены только региональные DNS."; pause; return; }; eval "SLOT_$slot=\"$id\""; save_state; }
 menu_dns(){ while :; do clear 2>/dev/null || true; printf "\\n${C_BOLD}DNS / HYBRID${C_NC}\\n\\n"; for s in 1 2 3 4 5 6 RU; do eval "v=\$SLOT_$s"; [ -n "$v" ] && printf "  %-3s %-32s %s\\n" "$s" "$(name_of "$v")" "$(region_of "$v")" || printf "  %-3s —\\n" "$s"; done; printf "\\n[1-6] Изменить основной DNS\\n[r]  Изменить RU DNS\\n[a]  Сбросить Hybrid по умолчанию\\n[t]  Проверить выбранные DNS\\n[x]  Применить DNSCrypt\\n[b]  Назад\\n"; menu_prompt; read -r c; case "$c" in 1|2|3|4|5|6) select_slot "$c";; r|R) select_slot RU;; a|A) set_defaults; save_state; ok "Hybrid-набор восстановлен."; pause;; t|T) test_selected; pause;; x|X) printf 'Применить DNSCrypt как основной DNS? [Y/n]: '; read -r a; case "$a" in n|N|нет|Нет) ;; *) apply_all || err "Применение не завершено.";; esac; pause;; b|B|"") return;; esac; done; }
-test_one(){ id="$1"; port="$2"; port_in_use "$port" && return 1; cfg="$TMP/test-$id.toml"; cp -p "$BASE_CFG" "$cfg" || return 1; sed -i '/^[[:space:]]*server_names[[:space:]]*=/d; /^[[:space:]]*listen_addresses[[:space:]]*=/d' "$cfg"; config_replace_line "$cfg" listen_addresses "[\"127.0.0.1:$port\"]" || return 1; config_replace_line "$cfg" server_names "['$id']" || return 1; printf '\n[static.'"'"'%s'"'"']\nstamp = '\''%s'\''\n' "$id" "$(stamp_of "$id")" >> "$cfg"; "$BIN" -config "$cfg" -check >/dev/null 2>&1 || return 1; "$BIN" -config "$cfg" >"$TMP/$id.log" 2>&1 & p=$!; i=0; okx=0; while [ "$i" -lt 8 ]; do if kill -0 "$p" 2>/dev/null && dns_query_local "$port" example.com; then okx=1; break; fi; sleep 1; i=$((i+1)); done; kill "$p" 2>/dev/null || true; kill -9 "$p" 2>/dev/null || true; [ "$okx" = 1 ]; }
+test_one(){ id="$1"; port="$2"; port_in_use "$port" && return 1; cfg="$TMP/test-$id.toml"; build_proxy_config "$cfg" "$port" "$id" 0 || return 1; "$BIN" -config "$cfg" >"$TMP/$id.log" 2>&1 & p=$!; i=0; okx=0; while [ "$i" -lt 8 ]; do if kill -0 "$p" 2>/dev/null && dns_query_local "$port" example.com; then okx=1; break; fi; sleep 1; i=$((i+1)); done; kill "$p" 2>/dev/null || true; kill -9 "$p" 2>/dev/null || true; [ "$okx" = 1 ]; }
 test_selected(){ [ -f "$BASE_CFG" ] || cp -p "$MAIN_CFG" "$BASE_CFG"; for s in 1 2 3 4 5 6 RU; do eval "id=\$SLOT_$s"; [ -n "$id" ] || continue; p="$(next_free_port)" || { warn "Нет свободного тестового порта $TEST_PORT_FIRST-$TEST_PORT_LAST."; return 1; }; printf '  Проверка %s → 127.0.0.1:%s ... ' "$(name_of "$id")" "$p"; if test_one "$id" "$p"; then printf '%b\n' "${C_GREEN}OK${C_NC}"; else printf '%b\n' "${C_RED}FAIL${C_NC}"; fi; done; }
 menu_settings(){ while :; do clear 2>/dev/null || true; printf "\\n${C_BOLD}ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ${C_NC}\\n\\n"; printf "  [1] QUIC                 %s\\n  [2] MSS/MTU              %s\\n  [3] Принудительный DNS    %s\\n  [4] TCP/Conntrack         %s\\n  [5] DNS cache              %s\\n  [6] NTP для клиентов       %s\\n  [7] Client fixes           %s\\n  [8] Watchdog               %s\\n  [9] Web access             %s\\n  [a] Применить доп. настройки\\n  [b] Назад\\n" "$QUIC" "$MSS" "$FORCE_DNS" "$TCP" "$CACHE" "$NTP_CLIENTS" "$CLIENT_FIXES" "$WATCHDOG" "$WEB"; menu_prompt; read -r c; case "$c" in 1) [ "$QUIC" = 1 ] && QUIC=0 || QUIC=1;; 2) [ "$MSS" = 1 ] && MSS=0 || MSS=1;; 3) [ "$FORCE_DNS" = 1 ] && FORCE_DNS=0 || FORCE_DNS=1;; 4) [ "$TCP" = 1 ] && TCP=0 || TCP=1;; 5) [ "$CACHE" = 1 ] && CACHE=0 || CACHE=1;; 6) [ "$NTP_CLIENTS" = 1 ] && NTP_CLIENTS=0 || NTP_CLIENTS=1;; 7) [ "$CLIENT_FIXES" = 1 ] && CLIENT_FIXES=0 || CLIENT_FIXES=1;; 8) [ "$WATCHDOG" = 1 ] && WATCHDOG=0 || WATCHDOG=1;; 9) [ "$WEB" = 1 ] && WEB=0 || WEB=1;; a|A) save_state; if [ "$CLIENT_FIXES" = 1 ]; then apply_client_fixes; else remove_client_fixes; fi; apply_all_extras && ok "Дополнительные настройки применены." || err "Не удалось применить все дополнительные настройки."; pause;; b|B|"") save_state; return;; esac; save_state; done; }
 menu_ntp(){ clear 2>/dev/null || true; printf "\\n${C_BOLD}NTP${C_NC}\\n  [1] Cloudflare\\n  [2] NIST\\n  [3] ВНИИФТРИ\\n  [4] Google\\n  Выбор: "; read -r c; case "$c" in 1) NTP_PRESET=cf_ip;; 2) NTP_PRESET=nist_ip;; 3) NTP_PRESET=vniiftri_moscow;; 4) NTP_PRESET=google_ip;; *) return;; esac; save_state; apply_ntp; pause; }
