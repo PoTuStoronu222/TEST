@@ -2,7 +2,7 @@
 # DNSCrypt Manager
 # Primary DNS manager based on dnscrypt-proxy2.
 # Canonical filename: dnscrypt-manager.sh
-VERSION="1.1"
+VERSION="1.2"
 
 BASE_DIR="/etc/dnscrypt-manager"
 STATE_DIR="$BASE_DIR/state"
@@ -35,6 +35,7 @@ err(){ printf "${C_RED}[✗] %s${C_NC}\n" "$*"; log "ERR $*"; }
 warn(){ printf "${C_YELLOW}[!] %s${C_NC}\n" "$*"; log "WARN $*"; }
 info(){ printf "${C_CYAN}[ℹ] %s${C_NC}\n" "$*"; log "INFO $*"; }
 pause(){ printf '\n%b' "${C_WHITE}Нажмите Enter...${C_NC}"; read -r _x; }
+menu_prompt(){ printf '\nВыберите пункт: '; }
 
 pkg_mgr(){ command -v apk >/dev/null 2>&1 && { printf apk; return; }; command -v opkg >/dev/null 2>&1 && { printf opkg; return; }; printf none; }
 pkg_installed(){ case "$(pkg_mgr)" in apk) apk info -e "$PKG" >/dev/null 2>&1;; opkg) opkg status "$PKG" 2>/dev/null | grep -q '^Status: install ok installed$';; *) return 1;; esac; }
@@ -52,7 +53,7 @@ ensure_package(){
 }
 
 write_catalog(){
-cat > "$CATALOG" <<'EOF_CATALOG'
+cat > "$CATALOG" <<EOF_CATALOG
 mafioznik|bypass|Mafioznik DNS|https://dns.mafioznik.com/dns-query|ru/global|sdns://AgAAAAAAAAAAAAARZG5zLm1hZmlvem5pay5jb20KL2Rucy1xdWVyeQ
 mafioznik_xyz|bypass|Mafioznik DNS XYZ|https://dns.mafioznik.xyz/dns-query|ru/global|sdns://AgAAAAAAAAAAAAARZG5zLm1hZmlvem5pay54eXoKL2Rucy1xdWVyeQ
 astracat|bypass|Astrakat DNS|https://dns.astrakat.ru/dns-query|ru/global|sdns://AgAAAAAAAAAAAAAPZG5zLmFzdHJha2F0LnJ1Ci9kbnMtcXVlcnk
@@ -237,11 +238,11 @@ port_in_use(){ p="$1"; if command -v ss >/dev/null 2>&1; then ss -lntu 2>/dev/nu
 next_free_port(){ start="${1:-$TEST_PORT_FIRST}"; end="${2:-$TEST_PORT_LAST}"; p="$start"; while [ "$p" -le "$end" ]; do if ! port_in_use "$p"; then printf '%s' "$p"; return 0; fi; p=$((p+1)); done; return 1; }
 
 snapshot_dnsmasq(){ sec="$(get_dnsmasq_sec)"; : > "$STATE_DIR/dnsmasq-before"; for k in server noresolv allservers strictorder cachesize dnsforwardmax max_cache_ttl boguspriv domainneeded quietdhcp filter_aaaa dhcp_option; do printf '%s|%s\n' "$k" "$(uci -q get dhcp.$sec.$k 2>/dev/null)" >> "$STATE_DIR/dnsmasq-before"; done; }
-get_dnsmasq_sec(){ secs="$(uci show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')"; for s in $secs; do [ "$(uci -q get dhcp.$s.interface 2>/dev/null)" = lan ] && { printf '%s' "$s"; return; }; done; s="$(printf '%s\n' $secs | head -n1)"; [ -n "$s" ] && printf '%s' "$s" || printf '@dnsmasq[0]"; }
+get_dnsmasq_sec(){ secs="$(uci show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p')"; for s in $secs; do [ "$(uci -q get dhcp.$s.interface 2>/dev/null)" = lan ] && { printf '%s' "$s"; return; }; done; s="$(printf '%s\n' $secs | head -n1)"; [ -n "$s" ] && printf '%s' "$s" || printf '%s' '@dnsmasq[0]'; }
 
 configure_dnsmasq(){ sec="$(get_dnsmasq_sec)"; snapshot_dnsmasq; uci -q delete "dhcp.$sec.server"; uci add_list "dhcp.$sec.server=127.0.0.1#$MAIN_PORT" || return 1; if [ -n "$SLOT_RU" ] && [ "$TLD" = 1 ]; then for t in /ru /su /xn--p1ai; do uci add_list "dhcp.$sec.server=$t/127.0.0.1#$RU_PORT" || return 1; done; fi; uci set "dhcp.$sec.noresolv=1" || return 1; uci set "dhcp.$sec.strictorder=0" || true; if [ "$BALANCE" = 1 ]; then uci set "dhcp.$sec.allservers=1" || return 1; else uci -q delete "dhcp.$sec.allservers"; fi; if [ "$CACHE" = 1 ]; then uci set "dhcp.$sec.cachesize=0" || true; fi; uci commit dhcp || return 1; /etc/init.d/dnsmasq restart >/dev/null 2>&1 || return 1; }
 
-restore_dnsmasq(){ [ -s "$STATE_DIR/dnsmasq-before" ] || return 0; sec="$(get_dnsmasq_sec)"; uci -q delete "dhcp.$sec.server"; while IFS='|' read -r k v; do case "$k" in server) for x in $v; do [ -n "$x" ] && uci add_list "dhcp.$sec.server=$x";; done;; noresolv|allservers|strictorder|cachesize|dnsforwardmax|max_cache_ttl|boguspriv|domainneeded|quietdhcp|filter_aaaa|dhcp_option) if [ -n "$v" ]; then uci set "dhcp.$sec.$k=$v"; else uci -q delete "dhcp.$sec.$k"; fi;; esac; done < "$STATE_DIR/dnsmasq-before"; uci commit dhcp >/dev/null 2>&1 || true; /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true; }
+restore_dnsmasq(){ [ -s "$STATE_DIR/dnsmasq-before" ] || return 0; sec="$(get_dnsmasq_sec)"; uci -q delete "dhcp.$sec.server"; while IFS='|' read -r k v; do case "$k" in server) for x in $v; do [ -n "$x" ] && uci add_list "dhcp.$sec.server=$x"; done;; noresolv|allservers|strictorder|cachesize|dnsforwardmax|max_cache_ttl|boguspriv|domainneeded|quietdhcp|filter_aaaa|dhcp_option) if [ -n "$v" ]; then uci set "dhcp.$sec.$k=$v"; else uci -q delete "dhcp.$sec.$k"; fi;; esac; done < "$STATE_DIR/dnsmasq-before"; uci commit dhcp >/dev/null 2>&1 || true; /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true; }
 
 apply_dns(){
     ensure_package || return 1; [ -f "$MAIN_CFG" ] || return 1; [ -f "$BASE_CFG" ] || cp -p "$MAIN_CFG" "$BASE_CFG" || return 1
@@ -274,7 +275,7 @@ apply_tcp(){
                 printf "%s|%s\n" "$k" "$(sysctl -n "$k" 2>/dev/null)" >> "$sf" || return 1
             done
         fi
-        cat > "$f.tmp" <<'EOF_SYSCTL'
+        cat > "$f.tmp" <<EOF_SYSCTL
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_fin_timeout=15
 net.core.somaxconn=1024
@@ -381,7 +382,7 @@ apply_client_fixes(){
     f="/etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf"
     sf="$STATE_DIR/client-before"
     if [ -f "$f" ] && [ ! -f "$sf" ]; then cp -p "$f" "$sf" || return 1; elif [ ! -f "$f" ] && [ ! -f "$sf" ]; then printf 'ABSENT\n' > "$sf"; fi
-    cat > "$f.tmp" <<'EOF_CLIENT
+    cat > "$f.tmp" <<EOF_CLIENT
 local=/telemetry.mozilla.org/
 local=/telemetry.microsoft.com/
 local=/vortex.data.microsoft.com/
@@ -417,7 +418,7 @@ watchdog_run(){
 }
 apply_watchdog(){ mkdir -p /etc/crontabs; grep -v 'dnscrypt-manager --watchdog' /etc/crontabs/root 2>/dev/null > "$TMP/root" || true; printf '*/5 * * * * /usr/bin/dnscrypt-manager --watchdog >> /etc/dnscrypt-manager/watchdog.log 2>&1\n' >> "$TMP/root"; cat "$TMP/root" > /etc/crontabs/root; chmod 600 /etc/crontabs/root; }
 remove_watchdog(){ [ -f /etc/crontabs/root ] || return 0; grep -v 'dnscrypt-manager --watchdog' /etc/crontabs/root > "$TMP/root" 2>/dev/null || true; cat "$TMP/root" > /etc/crontabs/root; chmod 600 /etc/crontabs/root; }
-apply_web(){ command -v ttyd >/dev/null 2>&1 || { pm="$(pkg_mgr)"; case "$pm" in apk) apk add ttyd >/dev/null 2>&1 || return 1;; opkg) opkg update >/dev/null 2>&1 && opkg install ttyd >/dev/null 2>&1 || return 1;; *) return 1;; esac; }; mkdir -p /usr/lib/lua/luci/controller; uci -q delete ttyd.dnscrypt_manager; uci set ttyd.dnscrypt_manager=ttyd || return 1; uci set ttyd.dnscrypt_manager.enable=1 || return 1; uci set ttyd.dnscrypt_manager.port=7682 || return 1; uci set ttyd.dnscrypt_manager.interface=@lan || return 1; uci set ttyd.dnscrypt_manager.command=/usr/bin/dnscrypt-manager || return 1; uci commit ttyd || return 1; uci -q delete firewall.dnscrypt_manager_web; uci set firewall.dnscrypt_manager_web=rule || return 1; uci set firewall.dnscrypt_manager_web.name='DNSCrypt Manager Web' || return 1; uci set firewall.dnscrypt_manager_web.src=lan || return 1; uci set firewall.dnscrypt_manager_web.proto=tcp || return 1; uci set firewall.dnscrypt_manager_web.dest_port=7682 || return 1; uci set firewall.dnscrypt_manager_web.target=ACCEPT || return 1; uci commit firewall || return 1; /etc/init.d/firewall reload >/dev/null 2>&1 || true; /etc/init.d/ttyd enable >/dev/null 2>&1 || true; /etc/init.d/ttyd restart >/dev/null 2>&1 || true; cat > /usr/lib/lua/luci/controller/dnscrypt_manager.lua <<'EOF_LUA'
+apply_web(){ command -v ttyd >/dev/null 2>&1 || { pm="$(pkg_mgr)"; case "$pm" in apk) apk add ttyd >/dev/null 2>&1 || return 1;; opkg) opkg update >/dev/null 2>&1 && opkg install ttyd >/dev/null 2>&1 || return 1;; *) return 1;; esac; }; mkdir -p /usr/lib/lua/luci/controller; uci -q delete ttyd.dnscrypt_manager; uci set ttyd.dnscrypt_manager=ttyd || return 1; uci set ttyd.dnscrypt_manager.enable=1 || return 1; uci set ttyd.dnscrypt_manager.port=7682 || return 1; uci set ttyd.dnscrypt_manager.interface=@lan || return 1; uci set ttyd.dnscrypt_manager.command=/usr/bin/dnscrypt-manager || return 1; uci commit ttyd || return 1; uci -q delete firewall.dnscrypt_manager_web; uci set firewall.dnscrypt_manager_web=rule || return 1; uci set firewall.dnscrypt_manager_web.name='DNSCrypt Manager Web' || return 1; uci set firewall.dnscrypt_manager_web.src=lan || return 1; uci set firewall.dnscrypt_manager_web.proto=tcp || return 1; uci set firewall.dnscrypt_manager_web.dest_port=7682 || return 1; uci set firewall.dnscrypt_manager_web.target=ACCEPT || return 1; uci commit firewall || return 1; /etc/init.d/firewall reload >/dev/null 2>&1 || true; /etc/init.d/ttyd enable >/dev/null 2>&1 || true; /etc/init.d/ttyd restart >/dev/null 2>&1 || true; cat > /usr/lib/lua/luci/controller/dnscrypt_manager.lua <<EOF_LUA
 module("luci.controller.dnscrypt_manager", package.seeall)
 function index()
  local uci=require "luci.model.uci".cursor()
