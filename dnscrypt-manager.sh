@@ -2,7 +2,7 @@
 # DNSCrypt Manager
 # Primary DNS manager based on dnscrypt-proxy2.
 # Canonical filename: dnscrypt-manager.sh
-VERSION="1.7"
+VERSION="1.9"
 
 BASE_DIR="/etc/dnscrypt-manager"
 STATE_DIR="$BASE_DIR/state"
@@ -20,8 +20,10 @@ PKG_INIT="/etc/init.d/dnscrypt-proxy"
 MANAGER_INIT="/etc/init.d/dnscrypt-manager"
 MAIN_PORT=5053
 RU_PORT=5054
-TEST_PORT_FIRST=5353
-TEST_PORT_LAST=5399
+TEST_PORT_FIRST=5400
+TEST_PORT_LAST=5499
+TEST_CONCURRENCY=10
+TEST_TIMEOUT=8
 
 C_GREEN='\033[1;32m'; C_RED='\033[1;31m'; C_CYAN='\033[1;36m'; C_YELLOW='\033[1;33m'; C_MAGENTA='\033[1;35m'; C_NC='\033[0m'; C_BOLD='\033[1m'; C_WHITE='\033[1;37m'
 
@@ -203,8 +205,8 @@ config_delete_key(){ sed -i "/^[[:space:]]*$1[[:space:]]*=/d" "$2" 2>/dev/null |
 build_static(){ ids="$1"; out="$2"; : > "$out" || return 1; for id in $ids; do name="$(name_of "$id")"; st="$(stamp_of "$id")"; [ -n "$name" ] && [ -n "$st" ] || { err "DNS '$id' отсутствует или не имеет stamp."; return 1; }; case "$id" in *"'"*) err "Некорректный ID DNS: $id"; return 1;; esac; printf "[static.'%s']\nstamp = '%s'\n\n" "$id" "$st" >> "$out"; done; }
 
 build_proxy_config(){ cfg="$1" port="$2" ids="$3" is_ru="$4"; [ -n "$ids" ] || return 1
-    # Do not edit the vendor example TOML in-place: it contains sample [static] data and
-    # commented keys under nested tables. Generate a minimal, deterministic config instead.
+    # Generate a self-contained config. Do not use a shared temporary static file:
+    # the full-catalog tester runs multiple proxies in parallel.
     arr=""; for id in $ids; do [ -n "$arr" ] && arr="$arr, "; arr="$arr'$id'"; done
     cat > "$cfg" <<EOF_PROXY
 server_names = [$arr]
@@ -234,8 +236,12 @@ EOF_PROXY
     else
         printf '%s\n' 'cache = false' >> "$cfg"
     fi
-    build_static "$ids" "$TMP/static.$$" || return 1
-    cat "$TMP/static.$$" >> "$cfg" || return 1
+    for id in $ids; do
+        name="$(name_of "$id")"; st="$(stamp_of "$id")"
+        [ -n "$name" ] && [ -n "$st" ] || { err "DNS '$id' отсутствует или не имеет stamp."; return 1; }
+        case "$id" in *"'"*) err "Некорректный ID DNS: $id"; return 1;; esac
+        printf "[static.'%s']\nstamp = '%s'\n\n" "$id" "$st" >> "$cfg" || return 1
+    done
     "$BIN" -config "$cfg" -check >"$TMP/check.$port" 2>&1 || { cat "$TMP/check.$port"; return 1; }
     return 0
 }
@@ -519,49 +525,98 @@ state_word(){ [ "$2" = 1 ] && { [ "$1" = 1 ] && printf "${C_GREEN}✓ ВКЛ •
 module_state(){ m="$1"; case "$m" in dns) dns_query_local "$MAIN_PORT" example.com && { sec="$(get_dnsmasq_sec)"; [ "$(uci -q get dhcp.$sec.noresolv 2>/dev/null)" = 1 ] && printf '%s\n' "$(uci -q get dhcp.$sec.server 2>/dev/null)" | tr ' ' '\n' | grep -qxF "127.0.0.1#$MAIN_PORT" && printf 1 || printf 0; } || printf 0;; ru) [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ] && dns_query_local "$RU_PORT" yandex.ru && printf 1 || printf 0;; quic) [ "$(uci -q get firewall.dnscrypt_manager_quic_80.dest_port 2>/dev/null)" = 80 ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_443.dest_port 2>/dev/null)" = 443 ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_80.target 2>/dev/null)" = REJECT ] && [ "$(uci -q get firewall.dnscrypt_manager_quic_443.target 2>/dev/null)" = REJECT ] && printf 1 || printf 0;; mtu) _mss_ok=0; for z in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\([^=]*\)=zone$/\1/p'); do zn="$(uci -q get firewall.$z.name 2>/dev/null)"; nets="$(uci -q get firewall.$z.network 2>/dev/null)"; case " $zn $nets " in *' wan '*|*' wan6 '*|*' wan wan6 '*) [ "$(uci -q get firewall.$z.mtu_fix 2>/dev/null)" = 1 ] && _mss_ok=1;; esac; done; [ "$_mss_ok" = 1 ] && printf 1 || printf 0;; force) [ "$(uci -q get firewall.dnscrypt_manager_dns_redirect.target 2>/dev/null)" = DNAT ] && [ "$(uci -q get firewall.dnscrypt_manager_dns_redirect.src_dport 2>/dev/null)" = 53 ] && printf 1 || printf 0;; tcp) _ok=1; for kv in 'net.ipv4.tcp_fastopen=3' 'net.ipv4.tcp_fin_timeout=15' 'net.core.somaxconn=1024' 'net.netfilter.nf_conntrack_max=65536' 'net.ipv4.tcp_keepalive_time=600' 'net.ipv4.tcp_keepalive_intvl=60' 'net.ipv4.tcp_keepalive_probes=5' 'net.core.rmem_max=4194304' 'net.core.wmem_max=4194304' 'net.core.rmem_default=262144' 'net.core.wmem_default=262144'; do _k="${kv%%=*}"; _v="${kv#*=}"; [ "$(sysctl -n "$_k" 2>/dev/null)" = "$_v" ] || _ok=0; done; [ "$_ok" = 1 ] && [ -s /etc/sysctl.d/90-dnscrypt-manager.conf ] && printf 1 || printf 0;; ntp_clients) [ "$(uci -q get firewall.dnscrypt_manager_ntp.dest_port 2>/dev/null)" = 123 ] && [ "$(uci -q get firewall.dnscrypt_manager_ntp.target 2>/dev/null)" = DNAT ] && printf 1 || printf 0;; web) [ "$(uci -q get ttyd.dnscrypt_manager.enable 2>/dev/null)" = 1 ] && pgrep -f '[t]tyd.*dnscrypt-manager' >/dev/null 2>&1 && printf 1 || printf 0;; watchdog) grep -q '/usr/bin/dnscrypt-manager --watchdog' /etc/crontabs/root 2>/dev/null && printf 1 || printf 0;; client) [ -f /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf ] && grep -q '^local=/telemetry.mozilla.org/$' /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf 2>/dev/null && grep -q '^server=/clients3.google.com/77.88.8.8$' /etc/dnsmasq.d/dnscrypt-manager-client-fixes.conf 2>/dev/null && printf 1 || printf 0;; *) printf 0;; esac; }
 _dns_state(){ dns_query_local "$MAIN_PORT" example.com || return 1; sec="$(get_dnsmasq_sec)"; [ "$(uci -q get dhcp.$sec.noresolv 2>/dev/null)" = 1 ] || return 1; printf '%s\n' "$(uci -q get dhcp.$sec.server 2>/dev/null)" | grep -qxF "127.0.0.1#$MAIN_PORT" || return 1; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then dns_query_local "$RU_PORT" yandex.ru || return 1; fi; return 0; }
 
-show_status(){ clear 2>/dev/null || true; printf '\n%b\n\n' "${C_BOLD}${C_YELLOW}DNSCrypt Manager $VERSION${C_NC}"; printf '  dnscrypt-proxy2:  %s\n' "$(pkg_installed && proxy_version || printf 'не установлен')"; printf '  Основной proxy:   127.0.0.1:%s  %s\n' "$MAIN_PORT" "$( [ "$(module_state dns)" = 1 ] && printf 'работает' || printf 'не активен')"; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then printf '  RU proxy:         127.0.0.1:%s  %s\n' "$RU_PORT" "$( [ "$(module_state ru)" = 1 ] && printf 'работает' || printf 'не активен')"; fi; sec="$(get_dnsmasq_sec)"; printf '  dnsmasq:           %s\n' "$(/etc/init.d/dnsmasq status >/dev/null 2>&1 && printf 'работает' || printf 'не работает')"; printf '  DNS-серверов:      %s основных + %s RU\n' "$(count_selected)" "$( [ -n "$SLOT_RU" ] && printf 1 || printf 0 )"; printf '  Hybrid:            %s\n' "$PROFILE"; printf '  Балансировка:      %s\n' "$(state_word "$(grep -Eq '^[[:space:]]*lb_strategy[[:space:]]*=' "$MAIN_CFG" 2>/dev/null && printf 1 || printf 0)" "$BALANCE")"; printf '  DNS cache:         %s\n' "$(state_word "$(grep -Eq '^[[:space:]]*cache[[:space:]]*=[[:space:]]*true' "$MAIN_CFG" 2>/dev/null && printf 1 || printf 0)" "$CACHE")"; printf '  RU routing:        %s\n' "$(state_word "$( [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ] && printf 1 || printf 0)" "$TLD")"; printf '\n%b\n' "${C_YELLOW}${C_BOLD}ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ${C_NC}"; printf '  QUIC:              %s\n' "$(state_word "$(module_state quic)" "$QUIC")"; printf '  MSS/MTU:           %s\n' "$(state_word "$(module_state mtu)" "$MSS")"; printf '  Принудительный DNS:%s\n' "$(state_word "$(module_state force)" "$FORCE_DNS")"; printf '  TCP/Conntrack:     %s\n' "$(state_word "$(module_state tcp)" "$TCP")"; printf '  NTP клиентов:      %s\n' "$(state_word "$(module_state ntp_clients)" "$NTP_CLIENTS")"; printf '  Client fixes:      %s\n' "$(state_word "$(module_state client)" "$CLIENT_FIXES")"; printf '  Watchdog:          %s\n' "$(state_word "$(module_state watchdog)" "$WATCHDOG")"; printf '  Web:               %s\n' "$(state_word "$(module_state web)" "$WEB")"; }
+show_status(){ clear 2>/dev/null || true; printf '\n%b\n\n' "${C_BOLD}${C_YELLOW}DNSCrypt Manager $VERSION${C_NC}"; printf '  dnscrypt-proxy2:  %s\n' "$(pkg_installed && proxy_version || printf 'не установлен')"; printf '  Основной proxy:   127.0.0.1:%s  %s\n' "$MAIN_PORT" "$( [ "$(module_state dns)" = 1 ] && printf 'работает' || printf 'не активен')"; if [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ]; then printf '  RU proxy:         127.0.0.1:%s  %s\n' "$RU_PORT" "$( [ "$(module_state ru)" = 1 ] && printf 'работает' || printf 'не активен')"; fi; sec="$(get_dnsmasq_sec)"; printf '  dnsmasq:           %s\n' "$(/etc/init.d/dnsmasq status >/dev/null 2>&1 && printf 'работает' || printf 'не работает')"; printf '  DNS-серверов:      %s выбранных + %s RU | каталог: %s\n' "$(count_selected)" "$( [ -n "$SLOT_RU" ] && printf 1 || printf 0 )" "$(grep -c '^[^#[:space:]]*|' "$CATALOG" 2>/dev/null || printf 0)"; printf '  Hybrid:            %s\n' "$PROFILE"; printf '  Балансировка:      %s\n' "$(state_word "$(grep -Eq '^[[:space:]]*lb_strategy[[:space:]]*=' "$MAIN_CFG" 2>/dev/null && printf 1 || printf 0)" "$BALANCE")"; printf '  DNS cache:         %s\n' "$(state_word "$(grep -Eq '^[[:space:]]*cache[[:space:]]*=[[:space:]]*true' "$MAIN_CFG" 2>/dev/null && printf 1 || printf 0)" "$CACHE")"; printf '  RU routing:        %s\n' "$(state_word "$( [ "$TLD" = 1 ] && [ -n "$SLOT_RU" ] && printf 1 || printf 0)" "$TLD")"; printf '\n%b\n' "${C_YELLOW}${C_BOLD}ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ${C_NC}"; printf '  QUIC:              %s\n' "$(state_word "$(module_state quic)" "$QUIC")"; printf '  MSS/MTU:           %s\n' "$(state_word "$(module_state mtu)" "$MSS")"; printf '  Принудительный DNS:%s\n' "$(state_word "$(module_state force)" "$FORCE_DNS")"; printf '  TCP/Conntrack:     %s\n' "$(state_word "$(module_state tcp)" "$TCP")"; printf '  NTP клиентов:      %s\n' "$(state_word "$(module_state ntp_clients)" "$NTP_CLIENTS")"; printf '  Client fixes:      %s\n' "$(state_word "$(module_state client)" "$CLIENT_FIXES")"; printf '  Watchdog:          %s\n' "$(state_word "$(module_state watchdog)" "$WATCHDOG")"; printf '  Web:               %s\n' "$(state_word "$(module_state web)" "$WEB")"; }
 select_slot(){ slot="$1"; clear 2>/dev/null || true; printf "\n${C_BOLD}Слот %s — выберите DNS${C_NC}\n\n" "$slot"; n=1; while IFS='|' read -r id cat name url region stamp; do [ -n "$id" ] || continue; if [ "$slot" = RU ] && [ "$cat" != regional ]; then continue; fi; printf "[%3s] %-32s [%s/%s]\n" "$n" "$name" "$cat" "$region"; eval "SEL_$n=\"$id\""; n=$((n+1)); done < "$CATALOG"; printf "\n[99] Очистить  [Enter] Назад\n"; printf 'Выбор: '; read -r c; [ -n "$c" ] || return; if [ "$c" = 99 ]; then eval "SLOT_$slot=\"\""; save_state; return; fi; eval "id=\${SEL_$c:-}" 2>/dev/null; [ -n "$id" ] || { warn "Неверный выбор."; pause; return; }; [ "$slot" != RU ] || [ "$(cat_of "$id")" = regional ] || { err "В RU-слот разрешены только региональные DNS."; pause; return; }; eval "SLOT_$slot=\"$id\""; save_state; }
-menu_dns(){ while :; do clear 2>/dev/null || true; printf "\\n${C_BOLD}DNS / HYBRID${C_NC}\\n\\n"; for s in 1 2 3 4 5 6 7 8 9 10 11 12 RU; do eval "v=\$SLOT_$s"; [ -n "$v" ] && printf "  %-3s %-32s %s\\n" "$s" "$(name_of "$v")" "$(region_of "$v")" || printf "  %-3s —\\n" "$s"; done; printf "\\n[1-6] Изменить основной DNS\\n[r]  Изменить RU DNS\\n[a]  Сбросить Hybrid по умолчанию\\n[t]  Проверить выбранные DNS\\n[x]  Применить DNSCrypt\\n[b]  Назад\\n"; menu_prompt; read -r c; case "$c" in 1|2|3|4|5|6|7|8|9|10|11|12) select_slot "$c";; r|R) select_slot RU;; a|A) set_defaults; save_state; ok "Hybrid-набор восстановлен."; pause;; t|T) test_selected; pause;; x|X) printf 'Применить DNSCrypt как основной DNS? [Y/n]: '; read -r a; case "$a" in n|N|нет|Нет) ;; *) apply_dns && ok "Основной DNSCrypt и RU routing применены." || err "Применение DNS не завершено.";; esac; pause;; b|B|"") return;; esac; done; }
+menu_dns(){ while :; do clear 2>/dev/null || true; printf "\\n${C_BOLD}DNS / HYBRID${C_NC}\\n\\n"; for s in 1 2 3 4 5 6 7 8 9 10 11 12 RU; do eval "v=\$SLOT_$s"; [ -n "$v" ] && printf "  %-3s %-32s %s\\n" "$s" "$(name_of "$v")" "$(region_of "$v")" || printf "  %-3s —\\n" "$s"; done; printf "\\n[1-6] Изменить основной DNS\\n[r]  Изменить RU DNS\\n[a]  Сбросить Hybrid по умолчанию\\n[t]  Проверить выбранные DNS\\n[x]  Применить DNSCrypt\\n[b]  Назад\\n"; menu_prompt; read -r c; case "$c" in 1|2|3|4|5|6|7|8|9|10|11|12) select_slot "$c";; r|R) select_slot RU;; a|A) set_defaults; save_state; ok "Hybrid-набор восстановлен."; pause;; t) test_selected; pause;; T) test_catalog_all; pause;; x|X) printf 'Применить DNSCrypt как основной DNS? [Y/n]: '; read -r a; case "$a" in n|N|нет|Нет) ;; *) apply_dns && ok "Основной DNSCrypt и RU routing применены." || err "Применение DNS не завершено.";; esac; pause;; b|B|"") return;; esac; done; }
 test_one(){
     id="$1"; port="$2"; domain="${3:-example.com}"
     port_in_use "$port" && return 1
-    cfg="$TMP/test-$id.toml"; logf="$TMP/$id.log"
-    build_proxy_config "$cfg" "$port" "$id" 0 || return 1
+    cfg="$TMP/test-$id-$port.toml"; logf="$TMP/$id-$port.log";
+    build_proxy_config "$cfg" "$port" "$id" 0 || return 2
     "$BIN" -config "$cfg" >"$logf" 2>&1 & p=$!
     okx=0; ready=0; i=0
-    while [ "$i" -lt 45 ]; do
+    while [ "$i" -lt "$TEST_TIMEOUT" ]; do
         if ! kill -0 "$p" 2>/dev/null; then break; fi
-        if grep -Eq 'Server with the lowest initial latency:|\] OK \((DoH|DNSCrypt)\)' "$logf" 2>/dev/null; then ready=1; fi
+        if grep -Eq '\] OK \((DoH|DNSCrypt)\)|Server with the lowest initial latency:' "$logf" 2>/dev/null; then ready=1; fi
         if [ "$ready" = 1 ] && port_in_use "$port" && dns_query_local "$port" "$domain"; then okx=1; break; fi
         sleep 1; i=$((i+1))
     done
     if [ "$okx" != 1 ]; then
-        tail -30 "$logf" 2>/dev/null >> "$LOG"
+        tail -20 "$logf" 2>/dev/null > "$TMP/fail-$id-$port.log"
+        cat "$TMP/fail-$id-$port.log" >> "$LOG" 2>/dev/null || true
     fi
     kill "$p" 2>/dev/null || true; sleep 1; kill -9 "$p" 2>/dev/null || true
     [ "$okx" = 1 ]
 }
+
+test_worker(){
+    id="$1"; idx="$2"; out="$3"
+    port=$((TEST_PORT_FIRST + idx))
+    if test_one "$id" "$port" example.com; then
+        printf 'OK|%s|%s|%s\n' "$id" "$port" "$(name_of "$id")" > "$out"
+    else
+        reason="$(tail -8 "$TMP/$id-$port.log" 2>/dev/null | tr '\n' ' ' | sed 's/[|]/\//g')"
+        printf 'FAIL|%s|%s|%s\n' "$id" "$port" "$reason" > "$out"
+    fi
+}
+
+run_catalog_parallel(){
+    list="$1"; tested=0; passed=0; idx=0; active=0; batch=0
+    : > "$TMP/catalog-results"
+    while IFS='|' read -r id cat name url region stamp; do
+        [ -n "$id" ] || continue
+        idx=$((idx+1)); out="$TMP/result-$idx"
+        test_worker "$id" "$((idx % TEST_CONCURRENCY))" "$out" &
+        active=$((active+1)); tested=$((tested+1))
+        printf '\r  Проверено: %s ... ' "$tested"
+        if [ "$active" -ge "$TEST_CONCURRENCY" ]; then
+            wait
+            active=0
+        fi
+    done < "$list"
+    [ "$active" -eq 0 ] || wait
+    printf '\r%80s\r' ''
+    n=0
+    while [ "$n" -lt "$idx" ]; do
+        n=$((n+1)); out="$TMP/result-$n"
+        [ -f "$out" ] || continue
+        IFS='|' read -r status rid rport detail < "$out"
+        case "$status" in
+            OK) printf '  ✓ %-34s %s\n' "$(name_of "$rid")" "$detail"; passed=$((passed+1));;
+            FAIL) printf '  ✗ %-34s FAIL\n' "$(name_of "$rid")";;
+        esac
+        printf '%s|%s|%s\n' "$status" "$rid" "$detail" >> "$TMP/catalog-results"
+    done
+    cp -f "$TMP/catalog-results" "$STATE_DIR/catalog-test-results" 2>/dev/null || true
+    printf '  Итог: %s/%s DNS работают\n' "$passed" "$tested"
+    [ "$tested" -gt 0 ] && [ "$passed" -gt 0 ]
+}
+
 test_selected(){
     [ -f "$BASE_CFG" ] || cp -p "$MAIN_CFG" "$BASE_CFG"
-    tested=0; passed=0
+    tmp="$TMP/selected-list"; : > "$tmp"
     for s in 1 2 3 4 5 6 7 8 9 10 11 12 RU; do
         eval "id=\$SLOT_$s"; [ -n "$id" ] || continue
-        p="$(next_free_port)" || { warn "Нет свободного тестового порта $TEST_PORT_FIRST-$TEST_PORT_LAST."; return 1; }
-        tested=$((tested+1))
-        printf '  Проверка %s → 127.0.0.1:%s ... ' "$(name_of "$id")" "$p"
-        if [ "$s" = RU ]; then td=yandex.ru; else td=example.com; fi
-        if test_one "$id" "$p" "$td"; then printf '%b\n' "${C_GREEN}OK${C_NC}"; passed=$((passed+1)); else printf '%b\n' "${C_RED}FAIL${C_NC}"; fi
+        awk -F'|' -v i="$id" '$1==i{print;exit}' "$CATALOG" >> "$tmp"
     done
-    [ "$tested" -gt 0 ] || { warn "Нет выбранных DNS для проверки."; return 1; }
-    printf '  Итог: %s/%s DNS работают\n' "$passed" "$tested"
-    [ "$passed" -eq "$tested" ]
+    [ -s "$tmp" ] || { warn "Нет выбранных DNS для проверки."; return 1; }
+    printf '\n  Проверка выбранного набора (%s DNS), параллельно до %s...\n' "$(wc -l < "$tmp")" "$TEST_CONCURRENCY"
+    run_catalog_parallel "$tmp"
+}
+
+test_catalog_all(){
+    [ -s "$CATALOG" ] || { write_catalog; }
+    count="$(grep -c '^[^#[:space:]]*|' "$CATALOG" 2>/dev/null || printf 0)"
+    printf '\n  Проверка всего каталога: %s DNS\n' "$count"
+    printf '  Параллельно: %s | таймаут одного DNS: %ss\n' "$TEST_CONCURRENCY" "$TEST_TIMEOUT"
+    run_catalog_parallel "$CATALOG"
 }
 menu_settings(){ while :; do clear 2>/dev/null || true; printf "\\n${C_BOLD}ДОПОЛНИТЕЛЬНЫЕ НАСТРОЙКИ${C_NC}\\n\\n"; printf "  [1] QUIC                 %s\\n  [2] MSS/MTU              %s\\n  [3] Принудительный DNS    %s\\n  [4] TCP/Conntrack         %s\\n  [5] DNS cache              %s\\n  [6] NTP для клиентов       %s\\n  [7] Client fixes           %s\\n  [8] Watchdog               %s\\n  [9] Web access             %s\\n  [a] Применить доп. настройки\\n  [b] Назад\\n" "$QUIC" "$MSS" "$FORCE_DNS" "$TCP" "$CACHE" "$NTP_CLIENTS" "$CLIENT_FIXES" "$WATCHDOG" "$WEB"; menu_prompt; read -r c; case "$c" in 1) [ "$QUIC" = 1 ] && QUIC=0 || QUIC=1;; 2) [ "$MSS" = 1 ] && MSS=0 || MSS=1;; 3) [ "$FORCE_DNS" = 1 ] && FORCE_DNS=0 || FORCE_DNS=1;; 4) [ "$TCP" = 1 ] && TCP=0 || TCP=1;; 5) [ "$CACHE" = 1 ] && CACHE=0 || CACHE=1;; 6) [ "$NTP_CLIENTS" = 1 ] && NTP_CLIENTS=0 || NTP_CLIENTS=1;; 7) [ "$CLIENT_FIXES" = 1 ] && CLIENT_FIXES=0 || CLIENT_FIXES=1;; 8) [ "$WATCHDOG" = 1 ] && WATCHDOG=0 || WATCHDOG=1;; 9) [ "$WEB" = 1 ] && WEB=0 || WEB=1;; a|A) save_state; if [ "$CLIENT_FIXES" = 1 ]; then apply_client_fixes; else remove_client_fixes; fi; apply_all_extras && ok "Дополнительные настройки применены." || err "Не удалось применить все дополнительные настройки."; pause;; b|B|"") save_state; return;; esac; save_state; done; }
 menu_ntp(){ clear 2>/dev/null || true; printf "\\n${C_BOLD}NTP${C_NC}\\n  [1] Cloudflare\\n  [2] NIST\\n  [3] ВНИИФТРИ\\n  [4] Google\\n  Выбор: "; read -r c; case "$c" in 1) NTP_PRESET=cf_ip;; 2) NTP_PRESET=nist_ip;; 3) NTP_PRESET=vniiftri_moscow;; 4) NTP_PRESET=google_ip;; *) return;; esac; save_state; if apply_ntp; then ok "NTP применён."; else err "Не удалось применить NTP."; fi; pause; }
 
 apply_all(){ snapshot_router; save_state; apply_dns || return 1; if [ "$CLIENT_FIXES" = 1 ]; then apply_client_fixes || return 1; else remove_client_fixes; fi; apply_all_extras || return 1; save_state; ok "DNSCrypt Manager полностью применён и проверен."; }
 
-main_menu(){ check_env || exit 1; ensure_package >/dev/null 2>&1 || true; if [ ! -s "$CATALOG" ]; then write_catalog; fi; load_state; [ -n "$SLOT_1$SLOT_2$SLOT_3$SLOT_4$SLOT_5$SLOT_6$SLOT_7$SLOT_8$SLOT_9$SLOT_10$SLOT_11$SLOT_12" ] || set_defaults; save_state; while :; do show_status; printf "\\n${C_BOLD}МЕНЮ${C_NC}\\n  [1] DNS / Hybrid\\n  [2] Проверка DNS\\n  [3] Дополнительные настройки\\n  [4] Серверы времени\\n  [5] Применить всё\\n  [6] Восстановить предыдущий DNS\\n  [7] Backup\\n  [0] Журнал\\n  [Enter] Выход\\n"; menu_prompt; read -r c; case "$c" in 1) menu_dns;; 2) test_selected; pause;; 3) menu_settings;; 4) menu_ntp;; 5) printf 'Применить всю конфигурацию как основной DNS? [Y/n]: '; read -r a; case "$a" in n|N|нет|Нет) ;; *) apply_all || err "Полное применение завершилось ошибкой.";; esac; pause;; 6) restore_dnsmasq; apply_tcp; MSS=0; apply_mss; QUIC=0; apply_quic; FORCE_DNS=0; apply_force; NTP_CLIENTS=0; apply_ntp_clients; restore_ntp; CACHE=0; apply_dnsmasq_perf; CLIENT_FIXES=0; remove_client_fixes; WEB=0; remove_web; WATCHDOG=0; remove_watchdog; [ -f "$BASE_CFG" ] && cp -p "$BASE_CFG" "$MAIN_CFG"; "$PKG_INIT" restart >/dev/null 2>&1 || true; stop_ru; save_state; ok "Состояние DNS и настройки менеджера восстановлены."; pause;; 7) backup_file "$MAIN_CFG"; ok "Backup выполнен."; pause;; 0) tail -n 100 "$LOG" 2>/dev/null; pause;; '') stop_ru; exit 0;; esac; done; }
+main_menu(){ check_env || exit 1; ensure_package >/dev/null 2>&1 || true; if [ ! -s "$CATALOG" ]; then write_catalog; fi; load_state; [ -n "$SLOT_1$SLOT_2$SLOT_3$SLOT_4$SLOT_5$SLOT_6$SLOT_7$SLOT_8$SLOT_9$SLOT_10$SLOT_11$SLOT_12" ] || set_defaults; save_state; while :; do show_status; printf "\\n${C_BOLD}МЕНЮ${C_NC}\\n  [1] DNS / Hybrid\\n  [2] Проверка DNS\\n  [3] Дополнительные настройки\\n  [4] Серверы времени\\n  [5] Применить всё\\n  [6] Восстановить предыдущий DNS\\n  [7] Backup\\n  [0] Журнал\\n  [Enter] Выход\\n"; menu_prompt; read -r c; case "$c" in 1) menu_dns;; 2) test_selected; pause;; c|C) test_catalog_all; pause;; 3) menu_settings;; 4) menu_ntp;; 5) printf 'Применить всю конфигурацию как основной DNS? [Y/n]: '; read -r a; case "$a" in n|N|нет|Нет) ;; *) apply_all || err "Полное применение завершилось ошибкой.";; esac; pause;; 6) restore_dnsmasq; apply_tcp; MSS=0; apply_mss; QUIC=0; apply_quic; FORCE_DNS=0; apply_force; NTP_CLIENTS=0; apply_ntp_clients; restore_ntp; CACHE=0; apply_dnsmasq_perf; CLIENT_FIXES=0; remove_client_fixes; WEB=0; remove_web; WATCHDOG=0; remove_watchdog; [ -f "$BASE_CFG" ] && cp -p "$BASE_CFG" "$MAIN_CFG"; "$PKG_INIT" restart >/dev/null 2>&1 || true; stop_ru; save_state; ok "Состояние DNS и настройки менеджера восстановлены."; pause;; 7) backup_file "$MAIN_CFG"; ok "Backup выполнен."; pause;; 0) tail -n 100 "$LOG" 2>/dev/null; pause;; '') stop_ru; exit 0;; esac; done; }
 
 if [ "${1:-}" = --watchdog ]; then check_env >/dev/null 2>&1; load_state; watchdog_run; exit $?; fi
 main_menu
